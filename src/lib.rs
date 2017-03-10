@@ -7,7 +7,6 @@
 //! ## Links
 //!   - repo:  https://github.com/berkowski/mio-serial
 //!   - docs:  https://docs.rs/mio-serial
-#![cfg(unix)]
 #![deny(missing_docs)]
 
 extern crate serialport;
@@ -17,6 +16,12 @@ extern crate mio;
 extern crate libc;
 #[cfg(unix)]
 extern crate termios;
+
+#[cfg(windows)]
+extern crate miow;
+
+#[cfg(windows)]
+extern crate winapi;
 
 // Enums, Structs, and Traits from the serialport crate
 pub use serialport::{// Traits
@@ -47,3 +52,6 @@ pub mod windows;
 
 #[cfg(unix)]
 pub use unix::Serial;
+
+#[cfg(windows)]
+pub use windows::Serial;

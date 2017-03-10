@@ -1,45 +1,404 @@
-use std::os::windows::prelude::*;
-use std::io;
-use std::path::Path;
-use std::convert::AsRef;
-
-use serialport::windows::COMport;
-
-pub fn from_path<T: AsRef<Path>>(path: T, settings: &::SerialPortSettings) -> io::Result<::Serial> {
-
-
-}
-
-use std::os::windows::prelude::*;
+//! Windows async COM
+//!
+//! Modeled after mio's windows TCP module.
 use std::io::{self, Read, Write};
-use std::path::Path;
 use std::convert::AsRef;
 use std::time::Duration;
+use std::os::Path;
+use std::os::windows::prelude::*;
 
-use libc;
-use mio::{Evented, PollOpt, Token, Poll, Ready};
-use mio::unix::EventedFd;
+use std::sync::{Mutex, MutexGuard};
+use std::fmt;
+use std::mem;
+
+use mio;
+use mio::sys::windows::from_raw_arc::FromRawArc;
+use mio::windows::{Overlapped, Binding};
+use mio::{poll, Ready, Poll, Token, PollOpt, IoVec};
+
+use miow::iocp::CompletionStatus;
+
+use winapi::*;
 
 use serialport;
 use serialport::windows::COMPort;
 use serialport::prelude::*;
 
+macro_rules! offset_of {
+    ($t:ty, $($field:ident).+) => (
+        &(*(0 as *const $t)).$($field).+ as *const _ as usize
+    )
+}
+
+macro_rules! overlapped2arc {
+    ($e:expr, $t:ty, $($field:ident).+) => ({
+        let offset = offset_of!($t, $($field).+);
+        debug_assert!(offset < mem::size_of::<$t>());
+        FromRawArc::from_raw(($e as usize - offset) as *mut $t)
+    })
+}
+
 pub struct Serial {
-    inner: serialport::windows::COMPort,
+    /// Serial is closely modeled after the TCP/UDP modules in mio for windows.
+    imp: SerialImp,
+    registration: Mutex<Option<mio::poll::Registration>>,
+
 }
 
 impl Serial {
     pub fn from_path<T: AsRef<Path>>(path: T, settings: &SerialPortSettings) -> io::Result<Self> {
-        COMPort.open(path.as_ref(), settings)
-            .map(|port| ::Serial { inner: port })
+        COMPort::open(path.as_ref(), settings)
+            .map(|port| Serial { 
+                registration: Mutex::new(None),
+                imp: SerialImp {
+                    inner: FromRawArc::new(SerialIo {
+                        read: Overlapped::new(read_done),
+                        write: Overlapped::new(write_done),
+                        serial: port,
+                        inner: Mutex::new(SerialInner {
+                            iocp: ReadyBinding::new(),
+                            read: State::Empty,
+                            write: State::Empty,
+                            instant_notify: false,
+                        }),
+                    }),
+                },
+            })
             .map_err(|_| Err(io::Error::last_os_error))
     }
+
+
+    fn inner(&self) -> MutexGuard<SerialInner> {
+        self.imp.inner()
+    }
+
+    fn post_register(&self, interest: Ready, me: &mut SerialInner) {
+        if interest.is_readable() {
+            self.imp.schedule_read(me);
+        }
+
+        // At least with epoll, if a socket is registered with an interest in
+        // writing and it's immediately writable then a writable event is
+        // generated immediately, so do so here.
+        if interest.is_writable() {
+            if let State::Empty = me.write {
+                self.imp.add_readiness(me, Ready::writable());
+            }
+        }
+    }
+
+    pub fn readv(&self, bufs: &mut [&mut IoVec]) -> io::Result<usize> {
+        let mut me = self.inner();
+
+        match me.read {
+            // Empty == we're not associated yet, and if we're pending then
+            // these are both cases where we return "would block"
+            State::Empty |
+            State::Pending(()) => return Err(wouldblock()),
+
+            // If we got a delayed error as part of a `read_overlapped` below,
+            // return that here. Also schedule another read in case it was
+            // transient.
+            State::Error(_) => {
+                let e = match mem::replace(&mut me.read, State::Empty) {
+                    State::Error(e) => e,
+                    _ => panic!(),
+                };
+                self.imp.schedule_read(&mut me);
+                return Err(e)
+            }
+
+            // If we're ready for a read then some previous 0-byte read has
+            // completed. In that case the OS's socket buffer has something for
+            // us, so we just keep pulling out bytes while we can in the loop
+            // below.
+            State::Ready(()) => {}
+        }
+
+        // TODO: Does WSARecv work on a nonblocking sockets? We ideally want to
+        //       call that instead of looping over all the buffers and calling
+        //       `recv` on each buffer. I'm not sure though if an overlapped
+        //       socket in nonblocking mode would work with that use case,
+        //       however, so for now we just call `recv`.
+
+        let mut amt = 0;
+        for buf in bufs {
+            let buf = buf.as_mut_bytes();
+
+            match (&self.imp.inner.serial).read(buf) {
+                // If we did a partial read, then return what we've read so far
+                Ok(n) if n < buf.len() => return Ok(amt + n),
+
+                // Otherwise filled this buffer entirely, so try to fill the
+                // next one as well.
+                Ok(n) => amt += n,
+
+                // If we hit an error then things get tricky if we've already
+                // read some data. If the error is "would block" then we just
+                // return the data we've read so far while scheduling another
+                // 0-byte read.
+                //
+                // If we've read data and the error kind is not "would block",
+                // then we stash away the error to get returned later and return
+                // the data that we've read.
+                //
+                // Finally if we haven't actually read any data we just
+                // reschedule a 0-byte read to happen again and then return the
+                // error upwards.
+                Err(e) => {
+                    if amt > 0 && e.kind() == io::ErrorKind::WouldBlock {
+                        me.read = State::Empty;
+                        self.imp.schedule_read(&mut me);
+                        return Ok(amt)
+                    } else if amt > 0 {
+                        me.read = State::Error(e);
+                        return Ok(amt)
+                    } else {
+                        me.read = State::Empty;
+                        self.imp.schedule_read(&mut me);
+                        return Err(e)
+                    }
+                }
+            }
+        }
+
+        Ok(amt)
+    }
+
+    pub fn writev(&self, bufs: &[&IoVec]) -> io::Result<usize> {
+        let mut me = self.inner();
+        let me = &mut *me;
+
+        match me.write {
+            State::Empty => {}
+            _ => return Err(wouldblock())
+        }
+
+        if !me.iocp.registered() {
+            return Err(wouldblock())
+        }
+
+        if bufs.len() == 0 {
+            return Ok(0)
+        }
+
+        let len = bufs.iter().map(|b| b.as_bytes().len()).fold(0, |a, b| a + b);
+        let mut intermediate = me.iocp.get_buffer(len);
+        for buf in bufs {
+            intermediate.extend_from_slice(buf.as_bytes());
+        }
+        self.imp.schedule_write(intermediate, 0, me);
+        Ok(len)
+    }
 }
+
+impl SerialImp {
+    fn inner(&self) -> MutexGuard<SerialInner> {
+        self.inner.inner.lock().unwrap()
+    }
+
+    fn schedule_read(&self, me: &mut SerialInner) {
+        match me.read {
+            State::Empty => {}
+            State::Ready(_) | State::Error(_) => {
+                self.add_readiness(me, Ready::readable());
+                return;
+            }
+            _ => return,
+        }
+
+        me.iocp.set_readiness(me.iocp.readiness() & !Ready::readable());
+
+        //trace!("scheduling a read");
+        let res = unsafe {
+            self.inner.serial.read_overlapped(&mut [], self.inner.read.as_mut_ptr())
+        };
+        match res {
+            // Note that `Ok(true)` means that this completed immediately and
+            // our socket is readable. This typically means that the caller of
+            // this function (likely `read` above) can try again as an
+            // optimization and return bytes quickly.
+            //
+            // Normally, though, although the read completed immediately
+            // there's still an IOCP completion packet enqueued that we're going
+            // to receive.
+            //
+            // You can configure this behavior (miow) with
+            // SetFileCompletionNotificationModes to indicate that `Ok(true)`
+            // does **not** enqueue a completion packet. (This is the case
+            // for me.instant_notify)
+            //
+            // Note that apparently libuv has scary code to work around bugs in
+            // `WSARecv` for UDP sockets apparently for handles which have had
+            // the `SetFileCompletionNotificationModes` function called on them,
+            // worth looking into!
+            Ok(Some(_)) if me.instant_notify => {
+                me.read = State::Ready(());
+                self.add_readiness(me, Ready::readable());
+            }
+            Ok(_) => {
+                // see docs above on SerialImp.inner for rationale on forget
+                me.read = State::Pending(());
+                mem::forget(self.clone());
+            }
+            Err(e) => {
+                // Like above, be sure to indicate that hup has happened
+                // whenever we get `ECONNRESET`
+                let mut set = Ready::readable();
+                if e.raw_os_error() == Some(WSAECONNRESET as i32) {
+                    //trace!("tcp stream at hup: econnreset");
+                    set = set | Ready::hup();
+                }
+                me.read = State::Error(e);
+                self.add_readiness(me, set);
+            }
+        }
+    }
+
+    /// Similar to `schedule_read`, except that this issues, well, writes.
+    ///
+    /// This function will continually attempt to write the entire contents of
+    /// the buffer `buf` until they have all been written. The `pos` argument is
+    /// the current offset within the buffer up to which the contents have
+    /// already been written.
+    ///
+    /// A new writable event (e.g. allowing another write) will only happen once
+    /// the buffer has been written completely (or hit an error).
+    fn schedule_write(&self,
+                      buf: Vec<u8>,
+                      mut pos: usize,
+                      me: &mut SerialInner) {
+
+        // About to write, clear any pending level triggered events
+        me.iocp.set_readiness(me.iocp.readiness() & !Ready::writable());
+
+        //trace!("scheduling a write");
+        loop {
+            let ret = unsafe {
+                self.inner.serial.write_overlapped(&buf[pos..], self.inner.write.as_mut_ptr())
+            };
+            match ret {
+                Ok(Some(transferred_bytes)) if me.instant_notify => {
+                    if transferred_bytes == buf.len() - pos {
+                        self.add_readiness(me, Ready::writable());
+                        me.write = State::Empty;
+                        break;
+                    }
+                    pos += transferred_bytes;
+                }
+                Ok(_) => {
+                    // see docs above on SerialImp.inner for rationale on forget
+                    me.write = State::Pending((buf, pos));
+                    mem::forget(self.clone());
+                    break;
+                }
+                Err(e) => {
+                    me.write = State::Error(e);
+                    self.add_readiness(me, Ready::writable());
+                    me.iocp.put_buffer(buf);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Pushes an event for this socket onto the selector its registered for.
+    ///
+    /// When an event is generated on this socket, if it happened after the
+    /// socket was closed then we don't want to actually push the event onto our
+    /// selector as otherwise it's just a spurious notification.
+    fn add_readiness(&self, me: &mut SerialInner, set: Ready) {
+        me.iocp.set_readiness(set | me.iocp.readiness());
+    }
+}
+
+fn read_done(status: &OVERLAPPED_ENTRY) {
+    let status = CompletionStatus::from_entry(status);
+    let me2 = SerialImp {
+        inner: unsafe { overlapped2arc!(status.overlapped(), SerialIo, read) },
+    };
+
+    let mut me = me2.inner();
+    match mem::replace(&mut me.read, State::Empty) {
+        State::Pending(()) => {
+            //trace!("finished a read: {}", status.bytes_transferred());
+            assert_eq!(status.bytes_transferred(), 0);
+            me.read = State::Ready(());
+            return me2.add_readiness(&mut me, Ready::readable())
+        }
+        s => me.read = s,
+    }
+
+    // If a read didn't complete, then the connect must have just finished.
+    //trace!("finished a connect");
+
+    match me2.inner.serial.connect_complete() {
+        Ok(()) => {
+            me2.add_readiness(&mut me, Ready::writable());
+            me2.schedule_read(&mut me);
+        }
+        Err(e) => {
+            me2.add_readiness(&mut me, Ready::readable() | Ready::writable());
+            me.read = State::Error(e);
+        }
+    }
+}
+
+fn write_done(status: &OVERLAPPED_ENTRY) {
+    let status = CompletionStatus::from_entry(status);
+    //trace!("finished a write {}", status.bytes_transferred());
+    let me2 = SerialImp {
+        inner: unsafe { overlapped2arc!(status.overlapped(), SerialIo, write) },
+    };
+    let mut me = me2.inner();
+    let (buf, pos) = match mem::replace(&mut me.write, State::Empty) {
+        State::Pending(pair) => pair,
+        _ => unreachable!(),
+    };
+    let new_pos = pos + (status.bytes_transferred() as usize);
+    if new_pos == buf.len() {
+        me2.add_readiness(&mut me, Ready::writable());
+    } else {
+        me2.schedule_write(buf, new_pos, &mut me);
+    }
+}
+
+#[derive(Clone)]
+struct SerialImp {
+    inner: FromRawArc<SerialIo>,
+}
+
+struct SerialIo {
+    inner: Mutex<SerialInner>,
+    read: Overlapped,
+    write: Overlapped,
+    serial: COMPort,
+}
+
+struct SerialInner {
+    iocp: ReadyBinding,
+    read: State<(), ()>,
+    write: State<(Vec<u8>, usize), (Vec<u8>, usize)>,
+    instant_notify: bool,
+}
+
+enum State<T, U> {
+    Empty,
+    Pending(T),
+    Ready(U),
+    Error(io::Error),
+}
+
 
 impl SerialPort for Serial {
     /// Returns a struct with the current port settings
     fn settings(&self) -> SerialPortSettings {
         self.inner.settings()
+    }
+
+    /// Return the name associated with the serial port, if known.
+    fn port_name(&self) -> Option<String> {
+        self.inner.port_name()
     }
 
     /// Returns the current baud rate.
@@ -236,62 +595,91 @@ impl SerialPort for Serial {
     }
 }
 
+impl AsRawHandle for Serial {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.inner.as_raw_handle()
+    }
+}
+
 impl Read for Serial {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        match unsafe {
-            libc::read(self.as_raw_fd(),
-                       bytes.as_ptr() as *mut libc::c_void,
-                       bytes.len() as libc::size_t)
-        } {
-            x if x >= 0 => Ok(x as usize),
-            _ => Err(io::Error::last_os_error()),
-        }
-    }
-}
-
-impl Write for Serial {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        match unsafe {
-            libc::write(self.as_raw_fd(),
-                        bytes.as_ptr() as *const libc::c_void,
-                        bytes.len() as libc::size_t)
-        } {
-            x if x >= 0 => Ok(x as usize),
-            _ => Err(io::Error::last_os_error()),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl AsRawFd for Serial {
-    fn as_raw_fd(&self) -> RawFd {
-        self.inner.as_raw_fd()
+        self.handle.read(bytes)
     }
 }
 
 impl Evented for Serial {
-    fn register(&self,
-                poll: &Poll,
-                token: Token,
-                interest: Ready,
-                opts: PollOpt)
-                -> io::Result<()> {
-        EventedFd(&self.as_raw_fd()).register(poll, token, interest, opts)
+    fn register(&self, poll: &Poll, token: Token,
+                interest: Ready, opts: PollOpt) -> io::Result<()> {
+        let mut me = self.inner();
+        try!(me.iocp.register_socket(&self.imp.inner.serial, poll, token,
+                                     interest, opts, &self.registration));
+
+        unsafe {
+            try!(super::no_notify_on_instant_completion(self.imp.inner.serial.as_raw_socket() as HANDLE));
+            me.instant_notify = true;
+        }
+
+        // If we were connected before being registered process that request
+        // here and go along our merry ways. Note that the callback for a
+        // successful connect will worry about generating writable/readable
+        // events and scheduling a new read.
+        if let Some(addr) = me.deferred_connect.take() {
+            return self.imp.schedule_connect(&addr).map(|_| ())
+        }
+        self.post_register(interest, &mut me);
+        Ok(())
     }
 
-    fn reregister(&self,
-                  poll: &Poll,
-                  token: Token,
-                  interest: Ready,
-                  opts: PollOpt)
-                  -> io::Result<()> {
-        EventedFd(&self.as_raw_fd()).reregister(poll, token, interest, opts)
+    fn reregister(&self, poll: &Poll, token: Token,
+                  interest: Ready, opts: PollOpt) -> io::Result<()> {
+        let mut me = self.inner();
+        try!(me.iocp.reregister_socket(&self.imp.inner.serial, poll, token,
+                                       interest, opts, &self.registration));
+        self.post_register(interest, &mut me);
+        Ok(())
     }
 
     fn deregister(&self, poll: &Poll) -> io::Result<()> {
-        EventedFd(&self.as_raw_fd()).deregister(poll)
+        self.inner().iocp.deregister(&self.imp.inner.serial,
+                                     poll, &self.registration)
     }
+}
+
+impl fmt::Debug for Serial {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        "TcpStream { ... }".fmt(f)
+    }
+}
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        // If we're still internally reading, we're no longer interested. Note
+        // though that we don't cancel any writes which may have been issued to
+        // preserve the same semantics as Unix.
+        //
+        // Note that "Empty" here may mean that a connect is pending, so we
+        // cancel even if that happens as well.
+        unsafe {
+            match self.inner().read {
+                State::Pending(_) | State::Empty => {
+                    //trace!("cancelling active Serial read");
+                    drop(super::cancel(&self.imp.inner.serial,
+                                       &self.imp.inner.read));
+                }
+                State::Ready(_) | State::Error(_) => {}
+            }
+        }
+    }
+}
+
+// TODO: Use std's allocation free io::Error
+const WOULDBLOCK: i32 = ::winapi::winerror::WSAEWOULDBLOCK as i32;
+
+/// Returns a std `WouldBlock` error without allocating
+pub fn would_block() -> ::std::io::Error {
+    ::std::io::Error::from_raw_os_error(WOULDBLOCK)
+}
+
+fn wouldblock() -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, "operation would block")
 }

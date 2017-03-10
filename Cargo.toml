@@ -19,6 +19,10 @@ serialport = {git = "https://gitlab.com/susurrus/serialport-rs"}
 libc = "0.2"
 termios = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+miow = "0.2"
+winapi = "0.2"
+
 [[example]]
 name = "serial_printline"
 path = "examples/serial_printline.rs"
