@@ -12,7 +12,7 @@ use std::fmt;
 use std::mem;
 
 use mio;
-use ::from_raw_arc::FromRawArc;
+use self::from_raw_arc::FromRawArc;
 use mio::windows::{Overlapped, Binding};
 use mio::{Ready, Poll, Token, PollOpt, IoVec};
 use mio::event::Evented;
