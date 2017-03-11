@@ -4,7 +4,7 @@
 use std::io::{self, Read, Write};
 use std::convert::AsRef;
 use std::time::Duration;
-use std::os::Path;
+use std::path::Path;
 use std::os::windows::prelude::*;
 
 use std::sync::{Mutex, MutexGuard};
@@ -41,7 +41,7 @@ macro_rules! overlapped2arc {
 
 unsafe fn cancel(socket: &AsRawSocket,
                  overlapped: &Overlapped) -> io::Result<()> {
-    let handle = socket.as_raw_socket() as winapi::HANDLE;
+    let handle = socket.as_raw_socket() as HANDLE;
     let ret = kernel32::CancelIoEx(handle, overlapped.as_mut_ptr());
     if ret == 0 {
         Err(io::Error::last_os_error())
@@ -50,15 +50,15 @@ unsafe fn cancel(socket: &AsRawSocket,
     }
 }
 
-unsafe fn no_notify_on_instant_completion(handle: winapi::HANDLE) -> io::Result<()> {
+unsafe fn no_notify_on_instant_completion(handle: HANDLE) -> io::Result<()> {
     // TODO: move those to winapi
-    const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: winapi::UCHAR = 1;
-    const FILE_SKIP_SET_EVENT_ON_HANDLE: winapi::UCHAR = 2;
+    const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: UCHAR = 1;
+    const FILE_SKIP_SET_EVENT_ON_HANDLE: UCHAR = 2;
 
     let flags = FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE;
 
     let r = kernel32::SetFileCompletionNotificationModes(handle, flags);
-    if r == winapi::TRUE {
+    if r == TRUE {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
@@ -700,7 +700,7 @@ impl Drop for Serial {
 }
 
 // TODO: Use std's allocation free io::Error
-const WOULDBLOCK: i32 = ::winapi::winerror::WSAEWOULDBLOCK as i32;
+const WOULDBLOCK: i32 = winerror::WSAEWOULDBLOCK as i32;
 
 /// Returns a std `WouldBlock` error without allocating
 pub fn would_block() -> ::std::io::Error {
