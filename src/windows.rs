@@ -204,6 +204,10 @@ impl Serial {
         }
     }
 
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.readv(&mut [buf.into()])
+    }
+
     pub fn readv(&self, bufs: &mut [&mut IoVec]) -> io::Result<usize> {
         let mut me = self.inner();
 
@@ -280,6 +284,10 @@ impl Serial {
         }
 
         Ok(amt)
+    }
+
+    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        self.writev(&[buf.into()])
     }
 
     pub fn writev(&self, bufs: &[&IoVec]) -> io::Result<usize> {
@@ -720,7 +728,17 @@ impl AsRawHandle for Serial {
 
 impl Read for Serial {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.handle.read(bytes)
+        <Serial>.read(self, bytes)
+    }
+}
+
+impl Write for Serial {
+    fn write(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        <Serial>.write(self, bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
