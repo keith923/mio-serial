@@ -22,7 +22,7 @@ termios = "0.2"
 [target.'cfg(windows)'.dependencies]
 miow = "0.2"
 winapi = "0.2"
-kernel32 = "0.2"
+kernel32-sys = "0.2"
 
 [[example]]
 name = "serial_printline"
