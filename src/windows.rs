@@ -728,13 +728,13 @@ impl AsRawHandle for Serial {
 
 impl Read for Serial {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        <Serial>.read(self, bytes)
+        <Serial>::read(self, bytes)
     }
 }
 
 impl Write for Serial {
-    fn write(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        <Serial>.write(self, bytes)
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        <Serial>::write(self, bytes)
     }
 
     fn flush(&mut self) -> io::Result<()> {
