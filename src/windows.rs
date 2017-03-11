@@ -14,11 +14,12 @@ use std::mem;
 use mio;
 use mio::sys::windows::from_raw_arc::FromRawArc;
 use mio::windows::{Overlapped, Binding};
-use mio::{poll, Ready, Poll, Token, PollOpt, IoVec};
+use mio::{Ready, Poll, Token, PollOpt, IoVec};
 
 use miow::iocp::CompletionStatus;
 
 use winapi::*;
+use kernel32;
 
 use serialport;
 use serialport::windows::COMPort;
@@ -38,10 +39,36 @@ macro_rules! overlapped2arc {
     })
 }
 
+unsafe fn cancel(socket: &AsRawSocket,
+                 overlapped: &Overlapped) -> io::Result<()> {
+    let handle = socket.as_raw_socket() as winapi::HANDLE;
+    let ret = kernel32::CancelIoEx(handle, overlapped.as_mut_ptr());
+    if ret == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+unsafe fn no_notify_on_instant_completion(handle: winapi::HANDLE) -> io::Result<()> {
+    // TODO: move those to winapi
+    const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: winapi::UCHAR = 1;
+    const FILE_SKIP_SET_EVENT_ON_HANDLE: winapi::UCHAR = 2;
+
+    let flags = FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE;
+
+    let r = kernel32::SetFileCompletionNotificationModes(handle, flags);
+    if r == winapi::TRUE {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 pub struct Serial {
     /// Serial is closely modeled after the TCP/UDP modules in mio for windows.
     imp: SerialImp,
-    registration: Mutex<Option<mio::poll::Registration>>,
+    registration: Mutex<Option<mio::Registration>>,
 
 }
 
@@ -56,7 +83,7 @@ impl Serial {
                         write: Overlapped::new(write_done),
                         serial: port,
                         inner: Mutex::new(SerialInner {
-                            iocp: ReadyBinding::new(),
+                            iocp: Binding::new(),
                             read: State::Empty,
                             write: State::Empty,
                             instant_notify: false,
@@ -376,7 +403,7 @@ struct SerialIo {
 }
 
 struct SerialInner {
-    iocp: ReadyBinding,
+    iocp: Binding,
     read: State<(), ()>,
     write: State<(Vec<u8>, usize), (Vec<u8>, usize)>,
     instant_notify: bool,
@@ -615,7 +642,7 @@ impl Evented for Serial {
                                      interest, opts, &self.registration));
 
         unsafe {
-            try!(super::no_notify_on_instant_completion(self.imp.inner.serial.as_raw_socket() as HANDLE));
+            try!(no_notify_on_instant_completion(self.imp.inner.serial.as_raw_socket() as HANDLE));
             me.instant_notify = true;
         }
 
@@ -663,7 +690,7 @@ impl Drop for Serial {
             match self.inner().read {
                 State::Pending(_) | State::Empty => {
                     //trace!("cancelling active Serial read");
-                    drop(super::cancel(&self.imp.inner.serial,
+                    drop(cancel(&self.imp.inner.serial,
                                        &self.imp.inner.read));
                 }
                 State::Ready(_) | State::Error(_) => {}

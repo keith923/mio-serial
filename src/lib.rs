@@ -23,6 +23,9 @@ extern crate miow;
 #[cfg(windows)]
 extern crate winapi;
 
+#[cfg(windows)]
+extern crate kernel32;
+
 // Enums, Structs, and Traits from the serialport crate
 pub use serialport::{// Traits
                      SerialPort,
